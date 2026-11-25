@@ -1,0 +1,190 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index e7b28a9..0bdbd3c 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -4,6 +4,7 @@ on:
+   push:
+     branches: [main]
+   pull_request:
++  workflow_dispatch:
+ 
+ concurrency:
+   group: ci-${{ github.ref }}
+@@ -11,7 +12,7 @@ concurrency:
+ 
+ jobs:
+   build:
+-    # macOS 15 matches LSMinimumSystemVersion in Support/Info.plist.
++    # Newer Xcode on macos-15 still targets macOS 11 (see DEPLOY in the Makefile).
+     runs-on: macos-15
+ 
+     steps:
+@@ -30,11 +31,21 @@ jobs:
+ 
+       # No signing certificate here, so this falls back to ad-hoc signing and
+       # prints a warning. That is expected: CI only proves the bundle builds.
+-      - name: Build app bundle
+-        run: make app
++      - name: Build universal app and disk image
++        run: |
++          make universal
++          make dmg
+ 
+       - name: Verify bundle
+         run: |
+           codesign --verify --strict dist/2cmd.app
+           plutil -lint dist/2cmd.app/Contents/Info.plist
+           test -f dist/2cmd.app/Contents/Resources/AppIcon.icns
++          # Both slices must load on macOS 11.
++          vtool -show-build dist/2cmd.app/Contents/MacOS/2cmd
++          test "$(vtool -show-build dist/2cmd.app/Contents/MacOS/2cmd | grep -c 'minos 11.0')" = 2
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: 2cmd-macos11
++          path: dist/2cmd.dmg
+diff --git a/Makefile b/Makefile
+index 5c3dcf9..3f8a82b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ APP_NAME := 2cmd
+ BUNDLE_ID := dev.anton.2cmd
+ BIN ?= .build/release/$(APP_NAME)
+-DEPLOY := 15.0
++DEPLOY := 11.0
+ DIST := dist
+ APP := $(DIST)/$(APP_NAME).app
+ 
+diff --git a/Package.swift b/Package.swift
+index 5d0ad73..edee6b5 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -7,7 +7,7 @@ import PackageDescription
+ // strict concurrency checking would only add noise around non-Sendable CF/CG types.
+ let package = Package(
+     name: "TwoCmd",
+-    platforms: [.macOS(.v15)],
++    platforms: [.macOS(.v11)],
+     products: [
+         .executable(name: "2cmd", targets: ["TwoCmd"])
+     ],
+diff --git a/README.md b/README.md
+index d9ab919..fd0e836 100644
+--- a/README.md
++++ b/README.md
+@@ -19,7 +19,7 @@ An assigned ordinary key switches on key down and suppresses its normal action.
+ 
+ ## Requirements
+ 
+-- macOS 15 or newer, Apple silicon or Intel
++- macOS 11 or newer, Apple silicon or Intel
+ - The input sources you want to use must already be enabled in
+   System Settings → Keyboard → Input Sources
+ - Building from source needs the Swift toolchain from the Command Line Tools;
+diff --git a/Sources/TwoCmd/LoginItem.swift b/Sources/TwoCmd/LoginItem.swift
+new file mode 100644
+index 0000000..698dc71
+--- /dev/null
++++ b/Sources/TwoCmd/LoginItem.swift
+@@ -0,0 +1,39 @@
++import Foundation
++import ServiceManagement
++
++/// Launch at login. `SMAppService` exists only on macOS 13+; older systems
++/// (macOS 11–12) get a per-user LaunchAgent that opens the app bundle at login.
++enum LoginItem {
++    private static let label = "dev.anton.2cmd"
++
++    private static var agentURL: URL {
++        FileManager.default.homeDirectoryForCurrentUser
++            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
++    }
++
++    static var isEnabled: Bool {
++        if #available(macOS 13, *) { return SMAppService.mainApp.status == .enabled }
++        return FileManager.default.fileExists(atPath: agentURL.path)
++    }
++
++    static func setEnabled(_ enabled: Bool) throws {
++        if #available(macOS 13, *) {
++            let service = SMAppService.mainApp
++            if enabled { try service.register() } else { try service.unregister() }
++            return
++        }
++        guard enabled else {
++            try FileManager.default.removeItem(at: agentURL)
++            return
++        }
++        let plist: [String: Any] = [
++            "Label": label,
++            "ProgramArguments": ["/usr/bin/open", Bundle.main.bundlePath],
++            "RunAtLoad": true,
++        ]
++        try FileManager.default.createDirectory(
++            at: agentURL.deletingLastPathComponent(), withIntermediateDirectories: true)
++        try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
++            .write(to: agentURL, options: .atomic)
++    }
++}
+diff --git a/Sources/TwoCmd/StatusItemController.swift b/Sources/TwoCmd/StatusItemController.swift
+index 3bbc9c4..89477e1 100644
+--- a/Sources/TwoCmd/StatusItemController.swift
++++ b/Sources/TwoCmd/StatusItemController.swift
+@@ -1,6 +1,5 @@
+ import AppKit
+ import ApplicationServices
+-import ServiceManagement
+ import TwoCmdCore
+ 
+ /// Menu bar icon plus its dropdown menu.
+@@ -109,7 +108,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
+         menu.addItem(
+             checkboxItem(
+                 title: "Launch at Login",
+-                isOn: SMAppService.mainApp.status == .enabled,
++                isOn: LoginItem.isEnabled,
+                 action: #selector(toggleLaunchAtLogin)
+             ))
+ 
+@@ -251,13 +250,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
+     }
+ 
+     @objc private func toggleLaunchAtLogin() {
+-        let service = SMAppService.mainApp
+         do {
+-            if service.status == .enabled {
+-                try service.unregister()
+-            } else {
+-                try service.register()
+-            }
++            try LoginItem.setEnabled(!LoginItem.isEnabled)
+         } catch {
+             presentAlert(
+                 title: "Could not change the login item",
+diff --git a/Support/Info.plist b/Support/Info.plist
+index 145fafc..e4c76af 100644
+--- a/Support/Info.plist
++++ b/Support/Info.plist
+@@ -23,7 +23,7 @@
+ 	<key>CFBundleVersion</key>
+ 	<string>2.0.1</string>
+ 	<key>LSMinimumSystemVersion</key>
+-	<string>15.0</string>
++	<string>11.0</string>
+ 	<key>LSUIElement</key>
+ 	<true/>
+ 	<key>NSPrincipalClass</key>
+diff --git a/Tools/make-homebrew-cask.sh b/Tools/make-homebrew-cask.sh
+index 722943d..02edc6e 100755
+--- a/Tools/make-homebrew-cask.sh
++++ b/Tools/make-homebrew-cask.sh
+@@ -24,7 +24,7 @@ cask "2cmd" do
+     strategy :github_latest
+   end
+ 
+-  depends_on macos: :sequoia
++  depends_on macos: ">= :big_sur"
+ 
+   app "2cmd.app"
+ 
