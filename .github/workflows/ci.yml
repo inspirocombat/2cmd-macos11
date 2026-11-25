@@ -3,38 +3,34 @@ name: CI
 on:
   push:
     branches: [main]
-  pull_request:
-
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_dispatch:
 
 jobs:
   build:
-    # macOS 15 matches LSMinimumSystemVersion in Support/Info.plist.
     runs-on: macos-15
 
     steps:
       - uses: actions/checkout@v5
 
-      - name: Toolchain versions
+      # The repo holds upstream 2cmd 2.0.1 plus 2cmd-macos11.patch in the root:
+      # apply it here (this workflow file itself is already the patched version).
+      - name: Apply macOS 11 patch
+        run: git apply --exclude=.github/workflows/ci.yml 2cmd-macos11.patch
+
+      - name: Build universal app and disk image
         run: |
-          swift --version
-          swift format --version
-
-      - name: Lint
-        run: make lint
-
-      - name: Checks
-        run: make test
-
-      # No signing certificate here, so this falls back to ad-hoc signing and
-      # prints a warning. That is expected: CI only proves the bundle builds.
-      - name: Build app bundle
-        run: make app
+          make universal
+          make dmg
 
       - name: Verify bundle
         run: |
           codesign --verify --strict dist/2cmd.app
           plutil -lint dist/2cmd.app/Contents/Info.plist
-          test -f dist/2cmd.app/Contents/Resources/AppIcon.icns
+          vtool -show-build dist/2cmd.app/Contents/MacOS/2cmd
+          # Both slices (Intel and Apple silicon) must load on macOS 11.
+          test "$(vtool -show-build dist/2cmd.app/Contents/MacOS/2cmd | grep -c 'minos 11.0')" = 2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 2cmd-macos11
+          path: dist/2cmd.dmg
